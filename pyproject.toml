@@ -1,0 +1,25 @@
+[tool.poetry]
+name = "solaris-tools"
+version = "0.1.0"
+description = "Solar pointing tools including AltAz scan error analysis."
+authors = ["Marco Buttu <marco.buttu@inaf.it>"]
+license = "MIT"
+readme = "README.md"
+packages = [{ include = "pointing" }]
+
+[tool.poetry.dependencies]
+python = ">=3.9"
+astropy = "*"
+numpy = "*"
+matplotlib = "*"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "*"
+hypothesis = "*"
+coverage = "*"
+nox = "*"
+ruff = "*"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
