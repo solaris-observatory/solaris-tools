@@ -31,6 +31,11 @@ import astropy.units as u
 import numpy as np
 
 
+class AzimuthError(Exception):
+    def __init__(self):
+        super().__init__("Trajectory crosses a full azimuth turn.")
+
+
 def compute_ideal_trajectory(
     location: EarthLocation,
     observation_time: Time,
@@ -207,6 +212,9 @@ def compute_errors(
     el_error = (real_altaz.alt - ideal_altaz.alt).to(u.arcsec)
     angular_error = np.sqrt(az_error**2 + el_error**2)
     max_error = np.max(angular_error)
+    # 100000 arcsec is just a dummy big value
+    if max_error > 100000*u.arcsec:
+        raise AzimuthError()
     mean_error = np.mean(angular_error)
 
     return max_error, mean_error

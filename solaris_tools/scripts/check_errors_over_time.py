@@ -29,7 +29,7 @@ import astropy.units as u
 import numpy as np
 import matplotlib.pyplot as plt
 import csv
-from pointing.altaz_scan_error import compute_errors
+from pointing.altaz_scan_error import compute_errors, AzimuthError
 from astropy.coordinates import EarthLocation
 
 
@@ -146,15 +146,18 @@ def main():
 
     results = []
     for t in sampling_times:
-        max_err, mean_err = compute_errors(
-            location,
-            t,
-            args.duration,
-            args.length,
-            args.delay,
-            args.interpolation_points,
-        )
-        results.append((t.iso, max_err.value, mean_err.value))
+        try:
+            max_err, mean_err = compute_errors(
+                location,
+                t,
+                args.duration,
+                args.length,
+                args.delay,
+                args.interpolation_points,
+            )
+            results.append((t.iso, max_err.value, mean_err.value))
+        except AzimuthError:
+            continue
 
     max_of_max_errors = max(r[1] for r in results)
     mean_of_mean_errors = np.mean([r[2] for r in results])
