@@ -3,25 +3,24 @@
 # License: MIT License
 
 """
-This module computes the maximum angular pointing error in AltAz coordinates
-introduced during a scan in Right Ascension (RA) under two combined sources
-of error:
+This module computes the maximum and mean angular pointing errors, in horizontal
+(AltAz) coordinates, that occur when a telescope scans the Sun along Right Ascension (RA).
+It simulates both the ideal scan and a real scan that approximates the ideal trajectory
+using a finite number of control points and interpolation. The real scan uses spherical
+linear interpolation (slerp) between control points for a more realistic simulation.
 
-1. Timing delay: the telescope moves with a fixed delay with respect to
-   the ideal tracking trajectory.
+Main features:
+- Calculates the ideal trajectory in AltAz (theoretical best path) for a scan along RA.
+- Simulates the real trajectory, which uses interpolation in AltAz between a user-defined
+  number of control points.
+- Computes the maximum and mean pointing errors between the ideal and real trajectories.
 
-2. Interpolation in AltAz: instead of following the ideal scanning path in
-   equatorial coordinates (RA/Dec), the movement is approximated in horizontal
-   coordinates (Az/El) using a polyline with interpolation points.
-
-Functions provided:
-- compute_ideal_trajectory: Computes the ideal AltAz scanning trajectory.
-- compute_real_trajectory: Computes the real (interpolated) scanning trajectory.
-- compute_errors: Computes maximum and mean angular errors between ideal and real trajectories.
+This is useful for telescope control software developers and astronomers who want
+to understand the effect of trajectory approximation on pointing precision.
 
 Usage:
 - Import the module and use the functions in your own scripts.
-- Run as a script for command-line usage.
+- Or run it from the command line to test with different parameters.
 """
 
 import argparse
@@ -32,8 +31,80 @@ import numpy as np
 
 
 class AzimuthError(Exception):
+    """
+    Exception raised if the trajectory wraps around the azimuth (i.e., passes
+    through a full 360° turn), which is not handled by this script.
+    """
+
     def __init__(self):
         super().__init__("Trajectory crosses a full azimuth turn.")
+
+
+def altaz_to_vec(az_deg, alt_deg):
+    """
+    Convert azimuth and altitude angles (in degrees) to a 3D unit vector.
+
+    Parameters:
+        az_deg (float or array): Azimuth angle(s) in degrees [0-360], measured from North.
+        alt_deg (float or array): Altitude angle(s) in degrees [−90 (horizon) to +90 (zenith)].
+
+    Returns:
+        numpy.ndarray: Array of shape (..., 3) with the [x, y, z] unit vectors.
+    """
+    az_rad = np.radians(az_deg)
+    alt_rad = np.radians(alt_deg)
+    x = np.cos(alt_rad) * np.cos(az_rad)
+    y = np.cos(alt_rad) * np.sin(az_rad)
+    z = np.sin(alt_rad)
+    return np.stack((x, y, z), axis=-1)
+
+
+def vec_to_altaz(vec):
+    """
+    Convert a 3D unit vector to azimuth and altitude angles (in degrees).
+
+    Parameters:
+        vec (numpy.ndarray): Array of 3D unit vectors (..., 3).
+
+    Returns:
+        tuple:
+            az (numpy.ndarray): Azimuth angle(s) in degrees [0-360].
+            alt (numpy.ndarray): Altitude angle(s) in degrees [−90 to +90].
+    """
+    x, y, z = vec[..., 0], vec[..., 1], vec[..., 2]
+    r = np.hypot(x, y)
+    az = (np.degrees(np.arctan2(y, x))) % 360
+    alt = np.degrees(np.arctan2(z, r))
+    return az, alt
+
+
+def slerp_vec(v0, v1, t_arr):
+    """
+    Perform spherical linear interpolation (slerp) between two 3D vectors.
+
+    Slerp smoothly interpolates between v0 and v1 along the shortest path
+    on the unit sphere.
+
+    Parameters:
+        v0 (numpy.ndarray): Starting vector (shape (3,))
+        v1 (numpy.ndarray): Ending vector (shape (3,))
+        t_arr (numpy.ndarray): Array of interpolation parameters, in [0, 1].
+            0 returns v0, 1 returns v1.
+
+    Returns:
+        numpy.ndarray: Interpolated vectors (shape (len(t_arr), 3))
+    """
+    v0 = v0 / np.linalg.norm(v0)
+    v1 = v1 / np.linalg.norm(v1)
+    dot = np.clip(np.dot(v0, v1), -1, 1)
+    omega = np.arccos(dot)
+    if np.isclose(omega, 0):
+        # The two vectors are almost identical, so just return copies of v0
+        return np.outer(np.ones_like(t_arr), v0)
+    sin_omega = np.sin(omega)
+    return (
+        np.sin((1 - t_arr) * omega)[:, None] * v0 + np.sin(t_arr * omega)[:, None] * v1
+    ) / sin_omega
 
 
 def compute_ideal_trajectory(
@@ -44,38 +115,43 @@ def compute_ideal_trajectory(
     num_samples: int = 100,
 ) -> SkyCoord:
     """
-    Compute the ideal scanning trajectory in AltAz coordinates by calculating
-    the apparent position of the Sun in equatorial coordinates (RA/Dec) along
-    a linear scan path defined by a given length and duration, then transforming
-    these positions into the horizontal coordinate system (Azimuth/Altitude)
-    for a specified observing location and time.
+    Compute the ideal scanning trajectory in AltAz coordinates.
+
+    The ideal trajectory is defined by moving linearly in RA (with Dec fixed to
+    the Sun's center) over the scan length, converting each sampled position
+    to AltAz.
 
     Parameters:
-        location (EarthLocation): Observing location.
-        observation_time (Time): Start time of observation.
-        scan_duration_sec (float): Scan duration in seconds.
-        scan_length_deg (float): Scan length in degrees.
-        num_samples (int): Number of samples along the trajectory.
+        location (EarthLocation): Observer's location on Earth.
+        observation_time (Time): Start time of the scan (UTC).
+        scan_duration_sec (float): Total duration of the scan, in seconds.
+        scan_length_deg (float): Total length of the scan, in degrees (in RA).
+        num_samples (int): Number of points in the trajectory.
 
     Returns:
-        SkyCoord: Ideal trajectory as SkyCoord object in AltAz frame.
+        SkyCoord: The ideal trajectory, as AltAz positions at the right times.
     """
+    # Get the Sun's center coordinates at the observation time
     sun_coord = get_sun(observation_time).transform_to("icrs")
     central_ra = sun_coord.ra.deg
     central_dec = sun_coord.dec.deg
 
+    # Calculate starting and ending RA, keeping Dec fixed
     start_ra = central_ra - scan_length_deg / (2 * np.cos(np.radians(central_dec)))
     end_ra = central_ra + scan_length_deg / (2 * np.cos(np.radians(central_dec)))
 
+    # Generate num_samples evenly spaced RA values along the scan
     ideal_ras = np.linspace(start_ra, end_ra, num_samples)
     ideal_coords = SkyCoord(ra=ideal_ras * u.deg, dec=central_dec * u.deg, frame="icrs")
+
+    # Generate the corresponding times for each sample point
     ideal_times = (
         observation_time + np.linspace(0, scan_duration_sec, num_samples) * u.second
     )
+    # Convert the ideal RA/Dec samples to AltAz
     ideal_altaz = ideal_coords.transform_to(
         AltAz(obstime=ideal_times, location=location)
     )
-
     return ideal_altaz
 
 
@@ -85,81 +161,87 @@ def compute_real_trajectory(
     scan_duration_sec: float,
     scan_length_deg: float,
     delay_time: float,
-    n_interp: int,
+    n_interp: int = 0,
     num_samples: int = 100,
 ) -> SkyCoord:
     """
-    Compute the real scanning trajectory in AltAz coordinates by simulating
-    a delayed and interpolated version of the ideal path. The function applies
-    a fixed timing delay to the scan start time and approximates the trajectory
-    using a specified number of interpolation points in RA. These interpolated
-    positions are then converted into the horizontal coordinate system
-    (Azimuth/Altitude) for the given location and observation time.
+    Compute the "real" scan trajectory in AltAz coordinates.
+
+    The real trajectory is simulated by:
+      - Generating a set of (n_interp + 2) control points in RA, evenly spaced
+        between the start and end of the scan, and at evenly spaced times.
+      - Converting each control point to AltAz.
+      - Using spherical linear interpolation (slerp) in AltAz between the control
+        points to generate a trajectory with exactly num_samples points.
+
+    This method guarantees that when n_interp = num_samples - 2, the real
+    trajectory matches the ideal one (error = 0).
 
     Parameters:
-        location (EarthLocation): Observing location.
-        observation_time (Time): Start time of observation.
-        scan_duration_sec (float): Scan duration in seconds.
-        scan_length_deg (float): Scan length in degrees.
-        delay_time (float): Delay in seconds.
-        n_interp (int): Number of interpolation points.
-        num_samples (int): Number of samples along the trajectory.
+        location (EarthLocation): Observer's location on Earth.
+        observation_time (Time): Start time of the scan (UTC).
+        scan_duration_sec (float): Total duration of the scan, in seconds.
+        scan_length_deg (float): Total length of the scan, in degrees (in RA).
+        delay_time (float): How much the scan is delayed (in seconds).
+        n_interp (int): Number of *intermediate* control points (total control points = n_interp + 2).
+        num_samples (int): Number of points in the output trajectory.
 
     Returns:
-        SkyCoord: Real trajectory as SkyCoord object in AltAz frame.
+        SkyCoord: The real (approximated) trajectory as AltAz positions at the right times.
     """
+    # Get the Sun's center coordinates at the observation time
     sun_coord = get_sun(observation_time).transform_to("icrs")
     central_ra = sun_coord.ra.deg
     central_dec = sun_coord.dec.deg
 
+    # Calculate starting and ending RA
     start_ra = central_ra - scan_length_deg / (2 * np.cos(np.radians(central_dec)))
     end_ra = central_ra + scan_length_deg / (2 * np.cos(np.radians(central_dec)))
-
     real_start_time = observation_time + delay_time * u.second
-    real_end_time = real_start_time + scan_duration_sec * u.second
 
-    if n_interp == 0:
-        start_coord = SkyCoord(
-            ra=start_ra * u.deg, dec=central_dec * u.deg, frame="icrs"
-        )
-        end_coord = SkyCoord(ra=end_ra * u.deg, dec=central_dec * u.deg, frame="icrs")
-        start_altaz = start_coord.transform_to(
-            AltAz(obstime=real_start_time, location=location)
-        )
-        end_altaz = end_coord.transform_to(
-            AltAz(obstime=real_end_time, location=location)
-        )
-        interp_az = np.linspace(start_altaz.az.deg, end_altaz.az.deg, num_samples)
-        interp_el = np.linspace(start_altaz.alt.deg, end_altaz.alt.deg, num_samples)
-        interp_times = (
-            real_start_time + np.linspace(0, scan_duration_sec, num_samples) * u.second
-        )
-    else:
-        segment_ras = np.linspace(start_ra, end_ra, n_interp + 2)
-        segment_times_all = np.linspace(
-            real_start_time.unix, real_end_time.unix, n_interp + 2
-        )
-        segment_times_all = Time(segment_times_all, format="unix")
-        times_for_interpolation = (
-            real_start_time + np.linspace(0, scan_duration_sec, num_samples) * u.second
-        )
-        ras_for_interpolation = np.interp(
-            times_for_interpolation.jd, segment_times_all.jd, segment_ras
-        )
-        interp_coords = SkyCoord(
-            ra=ras_for_interpolation * u.deg, dec=central_dec * u.deg, frame="icrs"
-        )
-        interp_altaz = interp_coords.transform_to(
-            AltAz(obstime=times_for_interpolation, location=location)
-        )
-        interp_az = interp_altaz.az.deg
-        interp_el = interp_altaz.alt.deg
-        interp_times = times_for_interpolation
+    # Generate control points in RA, evenly spaced, and their times
+    cpoints_ra = np.linspace(start_ra, end_ra, n_interp + 2)
+    cpoints_times = (
+        real_start_time + np.linspace(0, scan_duration_sec, n_interp + 2) * u.second
+    )
+    cpoints_icrs = SkyCoord(
+        ra=cpoints_ra * u.deg, dec=central_dec * u.deg, frame="icrs"
+    )
+    # Convert control points to AltAz coordinates
+    cpoints_altaz = cpoints_icrs.transform_to(
+        AltAz(obstime=cpoints_times, location=location)
+    )
+    ctrl_vecs = altaz_to_vec(cpoints_altaz.az.deg, cpoints_altaz.alt.deg)
+    ctrl_times_jd = cpoints_altaz.obstime.jd
+
+    # Create num_samples points, distributed proportionally along the full scan (from 0 to 1)
+    t_global = np.linspace(0, 1, num_samples)
+    n_segments = len(ctrl_vecs) - 1
+    seg_edges = np.linspace(0, 1, n_segments + 1)  # Edges of the segments
+
+    # For each sample t_global, find which segment it is in, and the local position in the segment (t_local)
+    seg_idx = np.searchsorted(seg_edges, t_global, side="right") - 1
+    seg_idx = np.clip(seg_idx, 0, n_segments - 1)
+    t_local = (t_global - seg_edges[seg_idx]) / (seg_edges[1] - seg_edges[0])
+
+    # Slerp for each segment
+    traj_vecs = np.array(
+        [
+            slerp_vec(ctrl_vecs[i], ctrl_vecs[i + 1], np.array([tl]))[0]
+            for i, tl in zip(seg_idx, t_local)
+        ]
+    )
+    # Interpolate time as well (linear between segment endpoints)
+    traj_times = (
+        ctrl_times_jd[seg_idx] * (1 - t_local) + ctrl_times_jd[seg_idx + 1] * t_local
+    )
+    traj_az, traj_alt = vec_to_altaz(traj_vecs)
+    traj_times_isot = Time(traj_times, format="jd", scale="utc").isot
 
     return SkyCoord(
-        az=interp_az * u.deg,
-        alt=interp_el * u.deg,
-        frame=AltAz(obstime=interp_times, location=location),
+        az=traj_az * u.deg,
+        alt=traj_alt * u.deg,
+        frame=AltAz(obstime=traj_times_isot, location=location),
     )
 
 
@@ -169,33 +251,27 @@ def compute_errors(
     scan_duration_sec: float,
     scan_length_deg: float,
     delay_time: float,
-    n_interp: int,
+    n_interp: int = 0,
     num_samples: int = 100,
 ) -> tuple[u.Quantity, u.Quantity]:
     """
-    Compute maximum and mean angular errors between ideal and real scanning
-    trajectories.
-
-    This function calculates both the maximum and the mean angular pointing error
-    in AltAz coordinates introduced by a fixed timing delay and path interpolation.
-    The ideal trajectory is computed as a continuous scan in RA/Dec converted to AltAz.
-    The real trajectory is simulated by delaying the scan start time and approximating
-    the path using a specified number of interpolation points in RA.
+    Compute the maximum and mean angular pointing errors (in arcseconds) between
+    the ideal and real scan trajectories in AltAz coordinates.
 
     Parameters:
-        location (EarthLocation): Observing location.
-        observation_time (Time): Start time of observation.
-        scan_duration_sec (float): Scan duration in seconds.
-        scan_length_deg (float): Scan length in degrees.
-        delay_time (float): Delay in seconds.
-        n_interp (int): Number of interpolation points in RA.
-        num_samples (int): Number of samples along the trajectory.
+        location (EarthLocation): Observer's location.
+        observation_time (Time): Start time of the scan.
+        scan_duration_sec (float): Scan duration, in seconds.
+        scan_length_deg (float): Scan length, in degrees (RA).
+        delay_time (float): Delay in seconds (between ideal and real scan).
+        n_interp (int): Number of intermediate control points (see compute_real_trajectory).
+        num_samples (int): Number of points in each trajectory.
 
     Returns:
         tuple: (max_error, mean_error), both as astropy Quantity in arcseconds.
-        max_error represents the highest angular deviation between the ideal and real trajectory.
-        mean_error represents the average angular deviation over all sampled points.
-"""
+            - max_error: The highest error during the scan.
+            - mean_error: The average error during the scan.
+    """
     ideal_altaz = compute_ideal_trajectory(
         location, observation_time, scan_duration_sec, scan_length_deg, num_samples
     )
@@ -212,17 +288,16 @@ def compute_errors(
     el_error = (real_altaz.alt - ideal_altaz.alt).to(u.arcsec)
     angular_error = np.sqrt(az_error**2 + el_error**2)
     max_error = np.max(angular_error)
-    # 100000 arcsec is just a dummy big value
-    if max_error > 100000*u.arcsec:
+    if max_error > 100000 * u.arcsec:
         raise AzimuthError()
     mean_error = np.mean(angular_error)
-
     return max_error, mean_error
 
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(
-        description="Compute pointing error in AltAz due to delay and path interpolation."
+        description="Compute pointing error in AltAz due to delay and path interpolation. "
+        "The real trajectory uses spherical interpolation between AltAz control points."
     )
     parser.add_argument(
         "-d",
@@ -246,14 +321,20 @@ if __name__ == "__main__":
         type=str,
         choices=["concordia", "testa_grigia"],
         default="concordia",
-        help="Observing location",
+        help="Observing location. Use 'concordia' or 'testa_grigia'.",
     )
     parser.add_argument(
         "-t",
         "--observation_time",
         type=str,
         default="2025-12-21T02:00:00",
-        help="Observation time in UTC",
+        help="Observation time in UTC, format: YYYY-MM-DDTHH:MM:SS",
+    )
+    parser.add_argument(
+        "--num_samples",
+        type=int,
+        default=100,
+        help="Total number of samples in the scan trajectory (default: 100)",
     )
     parser.add_argument(
         "-s",
@@ -262,23 +343,26 @@ if __name__ == "__main__":
         type=float,
         dest="delay",
         default=1.0,
-        help="Delay in seconds (default: 1.0)",
+        help="Delay in seconds between the ideal and real scan (default: 1.0)",
     )
     parser.add_argument(
-        "-n",
+        "-i",
         "--interpolation_points",
         type=int,
         default=0,
-        help="Number of intermediate interpolation points (default: 0)",
+        help="Number of intermediate interpolation (control) points (default: 0). "
+        "Total control points = i + 2",
     )
     args = parser.parse_args()
 
+    # Set the observing location based on user selection
     location = EarthLocation(lat=-75.1 * u.deg, lon=123.35 * u.deg, height=3233 * u.m)
     if args.location == "testa_grigia":
         location = EarthLocation(
             lat=45.8309 * u.deg, lon=7.7864 * u.deg, height=3315 * u.m
         )
 
+    # Compute and print errors
     max_error, mean_error = compute_errors(
         location,
         Time(args.observation_time),
@@ -286,7 +370,12 @@ if __name__ == "__main__":
         args.length,
         args.delay,
         args.interpolation_points,
+        args.num_samples,
     )
 
     print(f"Maximum angular error in AltAz during scan: {max_error:.2f}")
     print(f"Mean angular error in AltAz during scan: {mean_error:.2f}")
+
+
+if __name__ == "__main__":
+    main()

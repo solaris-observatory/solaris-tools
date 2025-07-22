@@ -19,6 +19,7 @@ hypothesis = "*"
 coverage = "*"
 nox = "*"
 ruff = "*"
+pytest-cov = "^6.2.1"
 
 [build-system]
 requires = ["poetry-core"]
